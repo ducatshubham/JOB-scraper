@@ -14,8 +14,8 @@ from playwright.async_api import async_playwright
 # -----------------------
 # File paths
 # -----------------------
-cookies_path = Path("cookies.json")
-output_csv = Path("linkedin_results.csv")
+cookies_path = Path("cookies_recruiter.json")
+output_csv = Path("linkedin_recruiter_results.csv")
 
 # Constants to reduce duplication
 SCROLL_HEIGHT_JS = "document.body.scrollHeight"
@@ -24,23 +24,27 @@ SCROLL_TO_TOP_JS = "window.scrollTo(0, 0)"
 SCROLL_TO_BOTTOM_JS = "window.scrollTo(0, document.body.scrollHeight)"
 
 # -----------------------
-# Helpers
+# Helpers for Recruiter
 # -----------------------
-def extract_role_from_url(search_url):
-    """Extract role/job title from LinkedIn search URL"""
+def extract_role_from_recruiter_url(search_url):
+    """Extract role/job title from LinkedIn Recruiter search URL"""
     try:
         parsed_url = urlparse(search_url)
         query_params = parse_qs(parsed_url.query)
         
-        # Get keywords parameter
-        keywords = query_params.get('keywords', [''])[0]
-        if keywords:
+        # Recruiter uses 'searchKeyword' parameter
+        search_keyword = query_params.get('searchKeyword', [''])[0]
+        if search_keyword:
             # Clean and format the role name
-            role = keywords.replace('%20', ' ').replace('+', ' ').strip()
+            role = search_keyword.replace('%22', '').replace('"', '').replace('%20', ' ').replace('%2520', ' ').strip()
             return role.title() if role else "Professional"
         return "Professional"
     except Exception:
         return "Professional"
+
+def validate_recruiter_url(url):
+    """Validate if URL is a LinkedIn Recruiter search URL"""
+    return "linkedin.com/talent/search" in url
 
 def ask_question(prompt_text: str) -> str:
     return input(prompt_text)
@@ -52,7 +56,7 @@ def save_to_csv(rows, role_name):
     # Use role name in filename
     role_clean = re.sub(r'[^\w\s-]', '', role_name).strip()
     role_clean = re.sub(r'[-\s]+', '_', role_clean)
-    output_file = Path(f"linkedin_{role_clean.lower()}_results.csv")
+    output_file = Path(f"linkedin_recruiter_{role_clean.lower()}_results.csv")
     
     headers = [
         "Name", "Title", "Location", "Education", "Profile URL",
@@ -108,19 +112,12 @@ async def auto_scroll(page, step=600, max_rounds=30, wait_ms=1500):
     except Exception as e:
         print(f"❌ Failed to scroll: {e}")
 
-def clean_profile_url(u: str) -> str:
-    """Remove tracking query params, force https, keep only /in/... path."""
+def clean_recruiter_profile_url(u: str) -> str:
+    """Clean recruiter profile URL - keep search context"""
     try:
-        parsed = urlparse(u)
-        if not parsed.netloc:
-            u = urljoin("https://www.linkedin.com", u)
-            parsed = urlparse(u)
-        path = parsed.path
-        if "/in/" in path:
-            if not path.endswith("/"):
-                path = path + "/"
-            clean_url = urlunparse(("https", "www.linkedin.com", path, "", "", ""))
-            return clean_url
+        # For recruiter URLs, we keep the full URL with search context
+        if "/talent/profile/" in u:
+            return u
         return u
     except Exception:
         return u
@@ -148,337 +145,243 @@ async def setup_browser(playwright):
         try:
             cookies = json.loads(cookies_path.read_text(encoding="utf-8"))
             await context.add_cookies(cookies)
-            print("✅ Loaded cookies from file.")
+            print("✅ Loaded recruiter cookies from file.")
         except Exception as e:
             print(f"❌ Failed to load cookies: {e}")
 
+    # Try to load LinkedIn first
     try:
+        print("🔄 Loading LinkedIn...")
         await page.goto("https://www.linkedin.com/feed/", timeout=90000)
         await page.wait_for_load_state("domcontentloaded")
-        print("✅ LinkedIn feed loaded successfully.")
-    except Exception:
-        print("❌ Failed to load LinkedIn feed.")
+        await page.wait_for_timeout(3000)
+        print("✅ LinkedIn loaded successfully.")
+    except Exception as e:
+        print(f"❌ Failed to load LinkedIn: {e}")
 
-    if "/login" in page.url or "challenge" in page.url:
-        print("👉 Please log in manually in the opened browser window...")
-        ask_question("🔑 Press Enter after login...")
+    # Check if we need to login
+    current_url = page.url
+    if "/login" in current_url or "challenge" in current_url or "/checkpoint" in current_url or "/uas/login" in current_url:
+        print("👉 Please log in manually with your LinkedIn account in the opened browser window...")
+        print("🔑 Make sure you have access to LinkedIn Recruiter!")
+        print("🔑 After login, navigate to LinkedIn Recruiter or just stay on the feed page")
+        ask_question("🔑 Press Enter after you've successfully logged in...")
+        
+        # Save cookies after login
         cookies = await context.cookies()
         cookies_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
         print("💾 Login session saved!")
+        
+        # Wait a bit more after login
+        await page.wait_for_timeout(5000)
+
+    # Test Recruiter access
+    try:
+        print("🔄 Testing LinkedIn Recruiter access...")
+        await page.goto("https://www.linkedin.com/talent/home", timeout=60000)
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(5000)
+        
+        current_url = page.url
+        if "/uas/login" in current_url or "/login" in current_url:
+            print("❌ LinkedIn Recruiter access denied. You may not have Recruiter permissions.")
+            print("🔄 Continuing with regular LinkedIn access...")
+            await page.goto("https://www.linkedin.com/feed/", timeout=60000)
+            await page.wait_for_load_state("domcontentloaded")
+        else:
+            print("✅ LinkedIn Recruiter access confirmed!")
+            
+    except Exception as e:
+        print(f"⚠️ Recruiter test failed: {e}")
+        print("🔄 Falling back to regular LinkedIn...")
+        try:
+            await page.goto("https://www.linkedin.com/feed/", timeout=60000)
+            await page.wait_for_load_state("domcontentloaded")
+        except Exception as e2:
+            print(f"❌ Failed to load LinkedIn: {e2}")
 
     return browser, context, page
 
 # -----------------------
-# Scrape Education
+# Scrape Education for Recruiter - UPDATED
 # -----------------------
-async def scrape_education(page, profile_url):
+async def scrape_recruiter_education(page, profile_url):
     try:
-        base_url = clean_profile_url(profile_url)
-        if "/in/" not in base_url:
-            return ""
-        username = base_url.split("/in/")[1].split("/")[0]
-        education_url = f"https://www.linkedin.com/in/{username}/details/education/"
-
-        print(f"🎓 Scraping education from: {education_url}")
-        await page.goto(education_url, timeout=90000)
-        await page.wait_for_timeout(4000)
-        await auto_scroll(page, step=700, max_rounds=15, wait_ms=1200)
-        await page.wait_for_timeout(2500)
-
-        education = await page.evaluate(r"""() => {
-            let collegeName = "";
+        education_data = await page.evaluate(r"""() => {
+            let education = "";
             
-            const eduItems = document.querySelectorAll('li.pvs-list__paged-list-item');
+            // Updated selectors based on DOM structure
+            const educationSelectors = [
+                '.text-highlighter__text[data-test-text-highlighter-text-only]',
+                'h2[data-test-expandable-list-title]:contains("Education") ~ * .text-highlighter__text',
+                '.text-highlighter__text',
+                '[data-test-education]',
+                '.education-section',
+                '.profile-education'
+            ];
             
-            for (const item of eduItems) {
-                try {
-                    const schoolNameEl = item.querySelector('.hoverable-link-text.t-bold span[aria-hidden="true"]');
-                    if (schoolNameEl) {
-                        const schoolText = schoolNameEl.innerText.trim();
-                        
-                        if (schoolText && 
-                            schoolText.length > 5 && 
-                            (schoolText.toLowerCase().includes('university') || 
-                             schoolText.toLowerCase().includes('college') || 
-                             schoolText.toLowerCase().includes('institute') ||
-                             schoolText.includes('IIT') ||
-                             schoolText.includes('NIT') ||
-                             schoolText.includes('IIIT') ||
-                             schoolText.includes('BITS') ||
-                             schoolText.toLowerCase().includes('school')) &&
-                            !schoolText.toLowerCase().includes('company') &&
-                            !schoolText.toLowerCase().includes('pvt') &&
-                            !schoolText.toLowerCase().includes('ltd') &&
-                            !schoolText.toLowerCase().includes('technologies') &&
-                            !schoolText.toLowerCase().includes('solutions')) {
-                            
-                            collegeName = schoolText;
-                            break;
+            // First, look for education section specifically
+            const educationHeaders = document.querySelectorAll('h2[data-test-expandable-list-title]');
+            for (const header of educationHeaders) {
+                if (header.textContent && header.textContent.includes('Education')) {
+                    // Found education section, look for institution names nearby
+                    let parent = header.parentElement;
+                    if (parent) {
+                        const textElements = parent.querySelectorAll('.text-highlighter__text[data-test-text-highlighter-text-only]');
+                        for (const el of textElements) {
+                            const text = el.textContent.trim();
+                            if (text && (text.includes('University') || text.includes('College') || text.includes('Institute') || text.includes('School'))) {
+                                education = text;
+                                break;
+                            }
                         }
                     }
-                } catch (e) {
-                    continue;
+                }
+                if (education) break;
+            }
+            
+            // Fallback to general text search
+            if (!education) {
+                const textElements = document.querySelectorAll('.text-highlighter__text[data-test-text-highlighter-text-only]');
+                for (const el of textElements) {
+                    const text = el.textContent.trim();
+                    if (text && (text.includes('University') || text.includes('College') || text.includes('Institute'))) {
+                        education = text;
+                        break;
+                    }
                 }
             }
             
-            return collegeName || "";
+            return education || "N/A";
         }""")
 
-        return education
+        return education_data if education_data and education_data != "N/A" else "Limited in Recruiter"
 
     except Exception as e:
         print(f"❌ Failed to scrape education for {profile_url}: {e}")
-        return ""
+        return "N/A"
 
 # -----------------------
-# Scrape Skills
+# Scrape Skills for Recruiter - UPDATED
 # -----------------------
-async def scrape_skills(page, profile_url):
+async def scrape_recruiter_skills(page, profile_url):
     try:
-        base_url = clean_profile_url(profile_url)
-        if "/in/" not in base_url:
-            return []
-        username = base_url.split("/in/")[1].split("/")[0]
-        skills_url = f"https://www.linkedin.com/in/{username}/details/skills/"
-
-        print(f"🔍 Scraping skills from: {skills_url}")
-        await page.goto(skills_url, timeout=90000)
-        await page.wait_for_timeout(4000)
-        await auto_scroll(page, step=700, max_rounds=20, wait_ms=1200)
-        await page.wait_for_timeout(3000)
-
         skills = await page.evaluate(r"""() => {
             const skillsList = [];
-            const seenSkills = new Set();
             
-            const skillItems = document.querySelectorAll('li.pvs-list__paged-list-item');
-            
-            skillItems.forEach((item) => {
-                try {
-                    const skillNameEl = item.querySelector('.hoverable-link-text.t-bold span[aria-hidden="true"]');
-                    if (skillNameEl) {
-                        const skillText = skillNameEl.innerText.trim();
-                        
-                        if (skillText && 
-                            skillText.length > 1 && 
-                            skillText.length < 50 &&
-                            !skillText.match(/^\d+/) &&
-                            !skillText.includes('experience') &&
-                            !skillText.includes('company') &&
-                            !skillText.includes('at ') &&
-                            !skillText.includes(' at ') &&
-                            !skillText.includes('|') &&
-                            !skillText.includes('endorsement') &&
-                            !skillText.includes('connection') &&
-                            !skillText.toLowerCase().includes('passed') &&
-                            !skillText.toLowerCase().includes('linkedin') &&
-                            !skillText.toLowerCase().includes('skill assessment') &&
-                            skillText !== '·') {
-                            
-                            if (!seenSkills.has(skillText.toLowerCase())) {
+            // Look for skills section based on DOM structure
+            const skillHeaders = document.querySelectorAll('h2[data-test-expandable-list-title]');
+            for (const header of skillHeaders) {
+                if (header.textContent && header.textContent.includes('Skills')) {
+                    // Found skills section, look for skill names
+                    let parent = header.parentElement;
+                    while (parent && !parent.classList.contains('experience-section')) {
+                        parent = parent.parentElement;
+                    }
+                    
+                    if (parent) {
+                        // Look for skill entities with the specific selector
+                        const skillElements = parent.querySelectorAll('dt[data-test-skill-entity-skill-name]');
+                        skillElements.forEach(el => {
+                            const skillText = el.textContent && el.textContent.trim();
+                            if (skillText && skillText.length > 1 && skillText.length < 100) {
                                 skillsList.push(skillText);
-                                seenSkills.add(skillText.toLowerCase());
-                            }
-                        }
-                    }
-                } catch (e) {
-                    // Continue if there's an error with this item
-                }
-            });
-
-            return skillsList;
-        }""")
-
-        return skills
-
-    except Exception as e:
-        print(f"❌ Failed to scrape skills for {profile_url}: {e}")
-        return []
-
-# -----------------------
-# Scrape Experience
-# -----------------------
-async def scrape_experience(page, profile_url):
-    try:
-        base_url = clean_profile_url(profile_url)
-        if "/in/" not in base_url:
-            return {
-                "experiences": [],
-                "currentCompany": "N/A",
-                "currentTitle": "N/A",
-                "totalExperience": "N/A"
-            }
-        username = base_url.split("/in/")[1].split("/")[0]
-        experience_url = f"https://www.linkedin.com/in/{username}/details/experience/"
-
-        print(f"🔍 Scraping experience from: {experience_url}")
-        await page.goto(experience_url, timeout=90000)
-        await page.wait_for_timeout(4000)
-        await auto_scroll(page, step=700, max_rounds=20, wait_ms=1200)
-        await page.wait_for_timeout(3000)
-
-        experience_data = await page.evaluate(r"""() => {
-            const experiences = [];
-            let currentCompany = "N/A";
-            let currentTitle = "N/A";
-            let totalExperience = "N/A";
-
-            const experienceItems = document.querySelectorAll('li.pvs-list__paged-list-item');
-            
-            experienceItems.forEach((item) => {
-                try {
-                    let title = "N/A";
-                    let company = "N/A";
-                    let duration = "N/A";
-                    let employmentType = "";
-                    
-                    const titleSelectors = [
-                        'div.display-flex.align-items-center span[aria-hidden="true"]',
-                        'div.hoverable-link-text.t-bold span[aria-hidden="true"]',
-                        '.pvs-entity__summary-info .hoverable-link-text span[aria-hidden="true"]',
-                        'a[data-field*="experience"] span[aria-hidden="true"]',
-                        '.t-bold span[aria-hidden="true"]'
-                    ];
-                    
-                    for (const selector of titleSelectors) {
-                        const titleEl = item.querySelector(selector);
-                        if (titleEl && titleEl.textContent && titleEl.textContent.trim()) {
-                            const titleText = titleEl.textContent.trim();
-                            if (!titleText.match(/\d+\s*(yr|mo|year|month)/i) && 
-                                titleText.length < 100 && 
-                                !titleText.includes('·')) {
-                                title = titleText;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    const companySelectors = [
-                        '.pvs-entity__sub-components .hoverable-link-text span[aria-hidden="true"]',
-                        '.t-14.t-normal span[aria-hidden="true"]',
-                        '.pvs-entity__summary-info .t-14 span[aria-hidden="true"]'
-                    ];
-                    
-                    for (const selector of companySelectors) {
-                        const companyEl = item.querySelector(selector);
-                        if (companyEl && companyEl.textContent && companyEl.textContent.trim()) {
-                            const companyText = companyEl.textContent.trim();
-                            if (!companyText.match(/Full-time|Part-time|Contract|Internship|Freelance|Self-employed|Temporary|\d+\s*(yr|mo)/i) &&
-                                !companyText.includes('·') &&
-                                companyText.length > 2) {
-                                company = companyText;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    const durationSelectors = [
-                        '.pvs-entity__caption-wrapper',
-                        '.t-12.t-normal span[aria-hidden="true"]',
-                        '.pvs-entity__sub-components .t-12 span[aria-hidden="true"]'
-                    ];
-                    
-                    for (const selector of durationSelectors) {
-                        const durationEl = item.querySelector(selector);
-                        if (durationEl && durationEl.textContent && durationEl.textContent.trim()) {
-                            const durationText = durationEl.textContent.trim();
-                            if (durationText.match(/\d+\s*(yr|mo|year|month)|Present|Current/i)) {
-                                duration = durationText;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    const subComponents = item.querySelector('.pvs-entity__sub-components');
-                    if (subComponents) {
-                        const companyNameEl = item.querySelector('.hoverable-link-text.t-bold span[aria-hidden="true"]');
-                        const companyName = companyNameEl ? companyNameEl.textContent.trim() : "N/A";
-                        
-                        const positions = subComponents.querySelectorAll('li.pvs-list__paged-list-item');
-                        positions.forEach(position => {
-                            try {
-                                const posTitle = position.querySelector('.hoverable-link-text.t-bold span[aria-hidden="true"]');
-                                const posDuration = position.querySelector('.pvs-entity__caption-wrapper');
-                                const posType = position.querySelector('.t-14.t-normal span[aria-hidden="true"]');
-                                
-                                experiences.push({
-                                    company: companyName,
-                                    title: posTitle ? posTitle.textContent.trim() : "N/A",
-                                    duration: posDuration ? posDuration.textContent.trim() : "N/A",
-                                    employmentType: posType ? posType.textContent.trim() : ""
-                                });
-                            } catch (e) {
-                                console.log('Error parsing position:', e);
                             }
                         });
-                    } else {
-                        if (title !== "N/A" || company !== "N/A") {
-                            experiences.push({
-                                company: company,
-                                title: title,
-                                duration: duration,
-                                employmentType: employmentType
+                        
+                        // Also try alternative selectors
+                        if (skillsList.length === 0) {
+                            const altSkillElements = parent.querySelectorAll('.skill-entity__skill-name, [title][data-test-skill-entity-skill-name]');
+                            altSkillElements.forEach(el => {
+                                const skillText = el.textContent && el.textContent.trim();
+                                if (skillText && skillText.length > 1 && skillText.length < 100) {
+                                    skillsList.push(skillText);
+                                }
                             });
                         }
                     }
-                    
-                } catch (e) {
-                    console.log('Error parsing experience item:', e);
-                }
-            });
-
-            const uniqueExperiences = [];
-            const seen = new Set();
-            
-            experiences.forEach(exp => {
-                const key = `${exp.company}-${exp.title}-${exp.duration}`;
-                if (!seen.has(key) && exp.title !== "N/A" && exp.company !== "N/A") {
-                    seen.add(key);
-                    uniqueExperiences.push(exp);
-                }
-            });
-
-            for (const exp of uniqueExperiences) {
-                if (exp.duration && /Present|Current/i.test(exp.duration)) {
-                    currentCompany = exp.company;
-                    currentTitle = exp.title;
                     break;
                 }
             }
             
-            if (currentCompany === "N/A" && uniqueExperiences.length > 0) {
-                currentCompany = uniqueExperiences[0].company;
-                currentTitle = uniqueExperiences[0].title;
+            // Remove duplicates and return
+            return [...new Set(skillsList)];
+        }""")
+
+        return skills if skills and len(skills) > 0 else ["Limited in Recruiter"]
+
+    except Exception as e:
+        print(f"❌ Failed to scrape skills for {profile_url}: {e}")
+        return ["N/A"]
+
+# -----------------------
+# Scrape Experience for Recruiter - UPDATED
+# -----------------------
+async def scrape_recruiter_experience(page, profile_url):
+    try:
+        experience_data = await page.evaluate(r"""() => {
+            const experiences = [];
+            let totalExperience = "N/A";
+
+            // Look for total experience first - based on DOM structure
+            const totalExpElement = document.querySelector('.t-14.t-black--light[data-test-grouped-position-entity-date-overall-range]');
+            if (totalExpElement) {
+                totalExperience = totalExpElement.textContent.trim();
             }
 
-            let totalYears = 0;
-            let totalMonths = 0;
-            
-            uniqueExperiences.forEach(exp => {
-                if (exp.duration) {
-                    const yearMatch = exp.duration.match(/(\d+)\s*(yr|year)s?/i);
-                    const monthMatch = exp.duration.match(/(\d+)\s*(mo|month)s?/i);
+            // Look for experience section
+            const experienceHeaders = document.querySelectorAll('h2[data-test-expandable-list-title]');
+            for (const header of experienceHeaders) {
+                if (header.textContent && header.textContent.includes('Experience')) {
+                    // Found experience section, look for position details
+                    let parent = header.parentElement;
+                    while (parent && parent.tagName !== 'SECTION') {
+                        parent = parent.parentElement;
+                    }
                     
-                    if (yearMatch) {
-                        totalYears += parseInt(yearMatch[1]);
+                    if (parent) {
+                        // Look for grouped position entities or individual experience items
+                        const expElements = parent.querySelectorAll('[data-test-grouped-position-entity], .experience-item, .pv-entity__summary-info');
+                        
+                        expElements.forEach(item => {
+                            try {
+                                let title = "N/A";
+                                let company = "N/A";
+                                let duration = "N/A";
+                                
+                                // Try to extract title, company and duration from various selectors
+                                const titleEl = item.querySelector('h3, .pv-entity__summary-info-v2 h3, [data-test-job-title], .t-bold');
+                                const companyEl = item.querySelector('.pv-entity__secondary-title, [data-test-company], .t-14');
+                                const durationEl = item.querySelector('[data-test-grouped-position-entity-date-range], .pv-entity__bullet-item-v2, [data-test-duration]');
+                                
+                                if (titleEl) {
+                                    title = titleEl.textContent.trim();
+                                }
+                                if (companyEl) {
+                                    company = companyEl.textContent.trim();
+                                }
+                                if (durationEl) {
+                                    duration = durationEl.textContent.trim();
+                                }
+                                
+                                if (title !== "N/A" || company !== "N/A") {
+                                    experiences.push({
+                                        title: title,
+                                        company: company,
+                                        duration: duration
+                                    });
+                                }
+                            } catch (e) {
+                                console.log('Error parsing experience item:', e);
+                            }
+                        });
                     }
-                    if (monthMatch) {
-                        totalMonths += parseInt(monthMatch[1]);
-                    }
+                    break;
                 }
-            });
-            
-            totalYears += Math.floor(totalMonths / 12);
-            totalMonths = totalMonths % 12;
-            
-            if (totalYears > 0 || totalMonths > 0) {
-                totalExperience = `${totalYears} yrs ${totalMonths} mos`;
             }
 
             return {
-                experiences: uniqueExperiences,
-                currentCompany: currentCompany,
-                currentTitle: currentTitle,
+                experiences: experiences,
                 totalExperience: totalExperience
             };
         }""")
@@ -489,23 +392,25 @@ async def scrape_experience(page, profile_url):
         print(f"❌ Failed to scrape experience for {profile_url}: {e}")
         return {
             "experiences": [],
-            "currentCompany": "N/A",
-            "currentTitle": "N/A",
             "totalExperience": "N/A"
         }
 
 # -----------------------
-# Scrape Profile
+# Scrape Recruiter Profile - UPDATED
 # -----------------------
-async def scrape_profile(page, profile_url):
+async def scrape_recruiter_profile(page, profile_url):
     try:
-        url = clean_profile_url(profile_url)
+        url = clean_recruiter_profile_url(profile_url)
+        print(f"🔍 Navigating to recruiter profile: {url}")
         await page.goto(url, timeout=90000)
         await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_selector("h1", timeout=15000)
-        await page.evaluate(SCROLL_TO_BOTTOM_JS)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(5000)
+        
+        # Scroll to load content
+        await auto_scroll(page, step=500, max_rounds=10, wait_ms=2000)
+        await page.wait_for_timeout(3000)
 
+        # Extract basic profile information - UPDATED based on DOM structure
         basic_data = await page.evaluate(r"""() => {
             const getText = (selectors) => {
                 for (const sel of selectors) {
@@ -515,80 +420,110 @@ async def scrape_profile(page, profile_url):
                 return "N/A";
             };
 
+            // Updated selectors based on DOM structure provided
             const name = getText([
-                "h1.inline.t-24.v-align-middle.break-words",
-                "h1.text-heading-xlarge",
-                "h1"
+                '.artdeco-entity-lockup__title.ember-view', // Exact selector from DOM
+                'div[id*="ember"].artdeco-entity-lockup__title',
+                '.artdeco-entity-lockup__title',
+                'h1',
+                '.profile-topcard__name',
+                '.profile-name'
             ]);
+            
             const title = getText([
-                "div.text-body-medium.break-words",
-                "div.text-body-medium",
-                ".mt1.t-18.t-black.t-normal.break-words"
+                'span[data-test-row-lockup-headline] em.sh', // Exact selector for highlighted title
+                'span[data-test-row-lockup-headline]', // Full headline
+                'em.sh', // Just the highlighted part
+                '.profile-topcard__headline',
+                '.profile-title',
+                '.artdeco-entity-lockup__subtitle'
             ]);
+            
             const location = getText([
-                "span.text-body-small.inline.t-black--light.break-words",
-                "span.text-body-small"
+                'div[data-test-row-lockup-location]', // Exact selector from DOM
+                'div[data-live-test-row-lockup-location]',
+                '.profile-topcard__location',
+                '.profile-location'
             ]);
 
             return {
-                name,
-                title,
-                location
+                name: name !== "N/A" ? name : "Name not found",
+                title: title !== "N/A" ? title : "Title not found", 
+                location: location !== "N/A" ? location.replace('·', '').trim() : "Location not found"
             };
         }""")
 
-        education_data = await scrape_education(page, url)
-        experience_data = await scrape_experience(page, url)
-        skills_data = await scrape_skills(page, url)
+        # Get additional profile data
+        education_data = await scrape_recruiter_education(page, url)
+        experience_data = await scrape_recruiter_experience(page, url)
+        skills_data = await scrape_recruiter_skills(page, url)
 
+        # Format experience details
         experience_details = []
         for exp in (experience_data.get("experiences") or []):
             detail = f"{exp.get('company','N/A')} | {exp.get('title','N/A')} | {exp.get('duration','N/A')}"
-            et = exp.get('employmentType')
-            if et:
-                detail += f" | {et}"
             experience_details.append(detail)
-        experience_details_str = " || ".join(experience_details[:5])
+        experience_details_str = " || ".join(experience_details)
 
+        # Format skills
         skills_str = " | ".join(skills_data) if skills_data else "N/A"
 
-        def clean_na(val):
-            return "" if val == "N/A" else val
-            
         result = {
-            "name": clean_na(basic_data.get("name", "N/A")),
+            "name": basic_data.get("name", "N/A"),
             "title": basic_data.get("title", "N/A"),
-            "location": clean_na(basic_data.get("location", "N/A")),
+            "location": basic_data.get("location", "N/A"),
             "education": education_data,
             "url": url,
-            "total_experience": clean_na(experience_data.get("totalExperience", "N/A")),
-            "experience_details": clean_na(experience_details_str),
-            "skills": clean_na(skills_str)
+            "total_experience": experience_data.get("totalExperience", "Limited in Recruiter"),
+            "experience_details": experience_details_str if experience_details_str else "Limited in Recruiter",
+            "skills": skills_str
         }
         
-        print(f"✅ Scraped {url}: {result['name']} - {result['title']}")
-            
+        print(f"✅ Scraped recruiter profile: {result['name']} - {result['title']}")
         return result
 
     except Exception as e:
-        print(f"❌ Failed to scrape {profile_url}: {e}")
+        print(f"❌ Failed to scrape recruiter profile {profile_url}: {e}")
         return {
-            "name": "N/A", "title": "N/A", "location": "N/A",
-            "education": "N/A", "url": clean_profile_url(profile_url),
-            "total_experience": "N/A", "experience_details": "N/A",
+            "name": "Failed to scrape", 
+            "title": "N/A", 
+            "location": "N/A",
+            "education": "N/A", 
+            "url": clean_recruiter_profile_url(profile_url),
+            "total_experience": "N/A", 
+            "experience_details": "N/A",
             "skills": "N/A"
         }
 
 # -----------------------
-# Collect Profile URLs from LinkedIn Search Results - DYNAMIC
+# Collect Profile URLs from LinkedIn Recruiter Search Results
 # -----------------------
-async def collect_search_profile_urls(page, search_url, limit, role_name):
+async def collect_recruiter_profile_urls(page, search_url, limit, role_name):
     profile_urls = set()
-    print(f"🔍 Starting to collect {limit} {role_name} profiles from search results: {search_url}")
+    print(f"🔍 Starting to collect {limit} {role_name} profiles from LinkedIn Recruiter: {search_url}")
 
-    await page.goto(search_url, timeout=90000)
-    await page.wait_for_load_state("domcontentloaded")
-    await page.wait_for_timeout(5000)
+    try:
+        await page.goto(search_url, timeout=90000)
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(8000)  # Longer wait for recruiter
+        
+        # Check if redirected to login
+        current_url = page.url
+        if "/uas/login" in current_url or "/login" in current_url or "/checkpoint" in current_url:
+            print("❌ Redirected to login page. LinkedIn Recruiter access required.")
+            print("🔑 Please ensure you:")
+            print("   1. Are logged in with correct credentials")
+            print("   2. Have LinkedIn Recruiter access")
+            print("   3. The search URL is valid and accessible")
+            return []
+            
+    except Exception as e:
+        print(f"❌ Failed to load search page: {e}")
+        print("🔍 This might be due to:")
+        print("   - No LinkedIn Recruiter access")
+        print("   - Invalid search URL")
+        print("   - Network issues")
+        return []
 
     max_attempts = 50
     attempt = 0
@@ -600,88 +535,107 @@ async def collect_search_profile_urls(page, search_url, limit, role_name):
         
         print(f"🔄 Collection attempt {attempt}/{max_attempts} - {role_name} profiles found: {len(profile_urls)}")
         
-        await auto_scroll(page, step=1200, max_rounds=20, wait_ms=1500)
-        await page.wait_for_timeout(4000)
+        # Scroll to load more profiles
+        await auto_scroll(page, step=1500, max_rounds=25, wait_ms=2000)
+        await page.wait_for_timeout(5000)
 
-        # LinkedIn Search Results - Next Page Navigation
-        try:
-            next_button_selectors = [
-                "button[aria-label='Next']",
-                "button[aria-label='next']",
-                ".artdeco-pagination__button--next",
-                "button.artdeco-pagination__button--next:not([disabled])",
-                "button:has-text('Next')",
-                "li.artdeco-pagination__indicator--number + li button",
-                ".artdeco-pagination__button.artdeco-pagination__button--next:not([disabled])"
-            ]
-            
-            for selector in next_button_selectors:
-                try:
-                    next_btn = await page.query_selector(selector)
-                    if next_btn:
-                        is_disabled = await next_btn.get_attribute('disabled')
-                        is_visible = await next_btn.is_visible()
-                        if not is_disabled and is_visible:
-                            print("➡️ Found and clicking Next button...")
-                            await next_btn.click()
-                            await page.wait_for_timeout(6000)
-                            break
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        # Debug: Check page content
+        page_content = await page.evaluate(r"""() => {
+            return {
+                url: window.location.href,
+                title: document.title,
+                hasProfiles: document.querySelectorAll('a[href*="/talent/profile/"]').length > 0,
+                profileCount: document.querySelectorAll('a[href*="/talent/profile/"]').length
+            };
+        }""")
+        print(f"📊 Page debug: {page_content}")
 
-        # Collect profile URLs from LinkedIn search results
+        # Collect profile URLs from LinkedIn Recruiter
         new_urls = await page.evaluate(r"""() => {
             const profileUrls = [];
             
-            // LinkedIn search results have specific structure
-            // Look for profile links in search result cards
-            const searchResults = document.querySelectorAll('.reusable-search__result-container, .entity-result, .search-result, .search-result__info, .search-entity-card');
+            // Recruiter-specific profile link patterns
+            const profileLinkSelectors = [
+                'a[href*="/talent/profile/"]',
+                '[data-test-link-to-profile-link="true"]',
+                '[data-live-test-link-to-profile-link="true"]',
+                'a[data-test-link-to-profile-link]',
+                'a[data-live-test-link-to-profile-link]'
+            ];
             
-            searchResults.forEach(result => {
-                // Look for profile links within each result
-                const profileLinks = result.querySelectorAll("a[href*='/in/']");
-                profileLinks.forEach(link => {
+            profileLinkSelectors.forEach(selector => {
+                const links = document.querySelectorAll(selector);
+                links.forEach(link => {
                     const href = link.href || link.getAttribute("href") || "";
-                    if (href && href.includes("/in/") && 
-                        !href.includes("/miniProfile/") && 
+                    if (href && href.includes("/talent/profile/") && 
                         !href.includes("/company/") &&
-                        !href.includes("/school/") &&
-                        !href.includes("/feed/") &&
-                        !href.includes("/posts/") &&
-                        !href.includes("/activity/")) {
-                        
-                        const cleanUrl = href.split('?')[0];
-                        profileUrls.push(cleanUrl);
+                        !href.includes("/school/")) {
+                        profileUrls.push(href);
                     }
                 });
             });
-
-            // Additional fallback - look for any profile links on page
-            const allProfileLinks = document.querySelectorAll("a[href*='/in/']");
-            allProfileLinks.forEach(link => {
-                const href = link.href || link.getAttribute("href") || "";
-                if (href && href.includes("/in/") && 
-                    !href.includes("/miniProfile/") && 
-                    !href.includes("/company/") &&
-                    !href.includes("/school/") &&
-                    !href.includes("/feed/") &&
-                    !href.includes("/posts/") &&
-                    !href.includes("/activity/")) {
-                    
-                    const cleanUrl = href.split('?')[0];
-                    profileUrls.push(cleanUrl);
+            
+            // Also look for candidate cards and extract profile links
+            const candidateCards = document.querySelectorAll('[data-test-member-card], .candidate-card, .search-result-card');
+            candidateCards.forEach(card => {
+                const profileLink = card.querySelector('a[href*="/talent/profile/"]');
+                if (profileLink) {
+                    const href = profileLink.href || profileLink.getAttribute("href");
+                    if (href) {
+                        profileUrls.push(href);
+                    }
                 }
             });
             
-            // Remove duplicates
-            return [...new Set(profileUrls)];
+            // Remove duplicates and return
+            const uniqueUrls = [...new Set(profileUrls)];
+            console.log(`Found ${uniqueUrls.length} profile URLs on page`);
+            return uniqueUrls;
         }""")
 
         for url in new_urls:
             if url:
                 profile_urls.add(url)
+
+        # LinkedIn Recruiter - Next Page Navigation
+        clicked_next = False
+        try:
+            next_button_selectors = [
+                'button[aria-label="Next"]',  # Common on new UIs
+                'button[aria-label="Go to next page"]',
+                'a[data-test-pagination-next]',
+                'a[data-live-test-pagination-next]',
+                'a.pagination__quick-link--next',
+                'a[rel="next"]',
+                'a[aria-label*="Go to next page"]',
+                'button.artdeco-pagination__button--next'
+            ]
+            
+            for selector in next_button_selectors:
+                try:
+                    next_element = await page.query_selector(selector)
+                    if next_element:
+                        if await next_element.is_disabled():
+                            print(f"ℹ️ Next button found but is disabled ('{selector}').")
+                            continue
+
+                        if await next_element.is_visible():
+                            print(f"➡️ Found next button ('{selector}'). Clicking...")
+                            await next_element.click()
+                            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                            await page.wait_for_timeout(random.randint(5000, 8000))
+                            clicked_next = True
+                            print("✅ Clicked next page and waited.")
+                            break  # Exit selector loop
+                except Exception as e:
+                    print(f"⚠️ Could not use selector '{selector}': {e}")
+                    continue
+            
+            if not clicked_next:
+                print("🤷 Could not find or click a 'Next' button.")
+
+        except Exception as e:
+            print(f"❌ Next button navigation failed: {e}")
 
         new_profiles_found = len(profile_urls) - previous_count
         print(f"📊 Found {new_profiles_found} new {role_name} profiles. Total profiles: {len(profile_urls)}")
@@ -691,19 +645,39 @@ async def collect_search_profile_urls(page, search_url, limit, role_name):
         else:
             no_new_profiles_count = 0
 
-        if no_new_profiles_count >= 8:
-            print("🔄 No new profiles found in recent attempts. Trying different scroll pattern...")
+        if no_new_profiles_count >= 5:  # Reduced threshold for recruiter
+            print("🔄 No new profiles found. Trying different scroll pattern...")
             await page.evaluate(SCROLL_TO_TOP_JS)
             await page.wait_for_timeout(4000)
             await page.evaluate(SCROLL_TO_BOTTOM_JS)
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(6000)
+            
+            # Try clicking "Show more" or "Load more" buttons
+            try:
+                load_more_selectors = [
+                    "button:has-text('Show more')",
+                    "button:has-text('Load more')",
+                    "[data-test-load-more]",
+                    ".artdeco-button--secondary"
+                ]
+                for selector in load_more_selectors:
+                    load_more_btn = await page.query_selector(selector)
+                    if load_more_btn and await load_more_btn.is_visible():
+                        print("🔄 Clicking 'Show more' button...")
+                        await load_more_btn.click()
+                        await page.wait_for_timeout(5000)
+                        break
+            except Exception:
+                pass
+                
             no_new_profiles_count = 0
 
         if len(profile_urls) >= limit:
             print(f"✅ Collected enough {role_name} profiles: {len(profile_urls)}")
             break
 
-        await delay(4000 + random.randint(3000, 6000))
+        # Longer delay for recruiter to avoid rate limiting
+        await delay(6000 + random.randint(4000, 8000))
 
     final_list = list(profile_urls)[:limit]
     print(f"🎯 Final collection: {len(final_list)} {role_name} profiles")
@@ -711,32 +685,31 @@ async def collect_search_profile_urls(page, search_url, limit, role_name):
     return final_list
 
 # -----------------------
-# Main execution function - DYNAMIC
+# Main execution function for Recruiter
 # -----------------------
 async def main():
     async with async_playwright() as p:
         browser, context, page = await setup_browser(p)
 
-        # Ask for LinkedIn search results URL
-        print("📝 Please provide the LinkedIn search results URL for any role/position")
-        print("Example: https://www.linkedin.com/search/results/people/?keywords=software%20engineer...")
-        print("Example: https://www.linkedin.com/search/results/people/?keywords=data%20scientist&geoUrn=%5B\"103644278\"%5D")
-        print("Example: https://www.linkedin.com/search/results/people/?keywords=product%20manager&currentCompany=%5B\"1441\"%5D")
+        print("📝 LinkedIn Recruiter Profile Scraper")
+        print("📝 Please provide the LinkedIn Recruiter talent search URL")
+        print("Example: https://www.linkedin.com/talent/search?searchContextId=...&searchKeyword=...")
         
-        search_url = ask_question("🔗 Enter the LinkedIn search results URL: ").strip()
+        search_url = ask_question("🔗 Enter the LinkedIn Recruiter search results URL: ").strip()
         if not search_url:
             print("❌ URL is required. Exiting.")
             await browser.close()
             return
 
-        # Validate URL format
-        if "linkedin.com/search/results/people" not in search_url:
-            print("❌ Please provide a valid LinkedIn people search results URL")
+        # Validate Recruiter URL format
+        if not validate_recruiter_url(search_url):
+            print("❌ Please provide a valid LinkedIn Recruiter talent search URL")
+            print("Make sure the URL contains '/talent/search'")
             await browser.close()
             return
 
-        # Extract role from URL
-        role_name = extract_role_from_url(search_url)
+        # Extract role from Recruiter URL
+        role_name = extract_role_from_recruiter_url(search_url)
         print(f"🎯 Detected role: {role_name}")
 
         try:
@@ -746,30 +719,98 @@ async def main():
 
         print(f"🎯 Target URL: {search_url}")
 
-        # Collect profile URLs from the search results page
-        urls = await collect_search_profile_urls(page, search_url, limit, role_name)
-        
-        if not urls:
-            print(f"❌ No {role_name} profile URLs found. Please check the URL or search filters.")
+        # Test access to the search URL first
+        print("🔍 Testing access to search URL...")
+        try:
+            test_response = await page.goto(search_url, timeout=60000)
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(3000)
+            
+            current_url = page.url
+            if "/uas/login" in current_url or "/login" in current_url:
+                print("❌ Search URL requires authentication or Recruiter access.")
+                print("🔑 Options:")
+                print("   1. Make sure you're logged in with the correct LinkedIn account")
+                print("   2. Verify you have LinkedIn Recruiter access")
+                print("   3. Try logging in manually in the browser")
+                
+                ask_question("Press Enter to try manual login, or Ctrl+C to exit...")
+                
+                # Try manual login flow
+                await page.goto("https://www.linkedin.com/login", timeout=60000)
+                print("👉 Please log in manually in the browser window...")
+                ask_question("🔑 Press Enter after successful login...")
+                
+                # Save new cookies
+                cookies = await context.cookies()
+                cookies_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+                print("💾 New login session saved!")
+                
+                # Test search URL again
+                await page.goto(search_url, timeout=60000)
+                await page.wait_for_load_state("domcontentloaded")
+                await page.wait_for_timeout(5000)
+                
+                if "/uas/login" in page.url or "/login" in page.url:
+                    print("❌ Still unable to access the search URL.")
+                    print("This usually means you don't have LinkedIn Recruiter access.")
+                    await browser.close()
+                    return
+                    
+            print("✅ Search URL accessible!")
+                
+        except Exception as e:
+            print(f"❌ Failed to access search URL: {e}")
             await browser.close()
             return
 
-        print(f"🎯 Starting to scrape {len(urls)} {role_name} profiles...")
+        # Collect profile URLs from the recruiter search results
+        urls = await collect_recruiter_profile_urls(page, search_url, limit, role_name)
+        
+        if not urls:
+            print(f"❌ No {role_name} profile URLs found.")
+            print("🔍 This could be due to:")
+            print("   - No search results on the page")
+            print("   - Different page structure than expected") 
+            print("   - Access restrictions")
+            print("\n🔧 Debugging info:")
+            
+            # Add debugging information
+            try:
+                page_title = await page.title()
+                current_url = page.url
+                print(f"   - Current page title: {page_title}")
+                print(f"   - Current URL: {current_url}")
+                
+                # Check if there are any profile-like elements
+                profile_elements = await page.evaluate("""() => {
+                    const profiles = document.querySelectorAll('a[href*="/in/"], a[href*="/talent/profile/"]');
+                    return profiles.length;
+                }""")
+                print(f"   - Profile-like elements found: {profile_elements}")
+                
+            except Exception as debug_e:
+                print(f"   - Debug info error: {debug_e}")
+                
+            await browser.close()
+            return
+
+        print(f"🎯 Starting to scrape {len(urls)} {role_name} profiles from Recruiter...")
         results = []
         
         for i, url in enumerate(urls, 1):
-            print(f"\n🔍 [{i}/{len(urls)}] Scraping {role_name} profile: {url}")
+            print(f"\n🔍 [{i}/{len(urls)}] Scraping {role_name} recruiter profile: {url}")
             try:
-                profile_data = await scrape_profile(page, url)
+                profile_data = await scrape_recruiter_profile(page, url)
                 results.append(profile_data)
                 
                 if i < len(urls):
-                    delay_time = 5000 + random.randint(2000, 8000)
+                    delay_time = 8000 + random.randint(4000, 10000)  # Longer delay for recruiter
                     print(f"⏳ Waiting {delay_time/1000:.1f}s before next profile...")
                     await delay(delay_time)
                     
             except Exception as e:
-                print(f"❌ Failed to scrape profile {url}: {e}")
+                print(f"❌ Failed to scrape recruiter profile {url}: {e}")
                 results.append({
                     "name": "Failed to scrape", 
                     "title": "N/A", 
@@ -783,10 +824,10 @@ async def main():
 
         # Save results to CSV
         if results:
-            output_file = save_to_csv(results, role_name)
+            output_file = save_to_csv(results, f"Recruiter_{role_name}")
             open_excel(output_file)
             
-            print(f"\n🎉 LinkedIn {role_name} Profile Scraping completed!")
+            print(f"\n🎉 LinkedIn Recruiter {role_name} Profile Scraping completed!")
             print(f"📊 Total {role_name} profiles scraped: {len(results)}")
             print(f"📁 Results saved to: {output_file}")
         else:
@@ -797,14 +838,16 @@ async def main():
 # Entry point
 # -----------------------
 if __name__ == "__main__":
-    print("🚀 LinkedIn Dynamic Profile Scraper")
-    print("=" * 60)
-    print("📝 This script works with LinkedIn search results URLs for ANY role/position")
-    print("📝 Example: https://www.linkedin.com/search/results/people/?keywords=software%20engineer...")
-    print("📝 Example: https://www.linkedin.com/search/results/people/?keywords=data%20scientist&currentCompany=...")
-    print("📝 Make sure to apply your desired filters on LinkedIn first, then copy the URL")
-    print("📝 The script will automatically detect the role from your search URL")
-    print("=" * 60)
+    print("🚀 LinkedIn Recruiter Dynamic Profile Scraper")
+    print("=" * 70)
+    print("📝 This script works with LinkedIn Recruiter talent search URLs")
+    print("📝 Example: https://www.linkedin.com/talent/search?searchContextId=...&searchKeyword=...")
+    print("📝 Requirements:")
+    print("   - LinkedIn Recruiter account access")
+    print("   - Valid talent search URL from LinkedIn Recruiter")
+    print("   - Proper login credentials")
+    print("📝 Make sure to apply your desired filters in Recruiter first, then copy the URL")
+    print("=" * 70)
     
     try:
         asyncio.run(main())
@@ -813,4 +856,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Unexpected error: {e}")
 
-    print("\n👋 Thanks for using the LinkedIn Dynamic Profile scraper!")
+    print("\n👋 Thanks for using the LinkedIn Recruiter Profile scraper!")
