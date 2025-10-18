@@ -1,0 +1,2 @@
+   14  cat ~/.bash_history | grep -A 1 "Scraped recruiter profile\|Found public profile URL" > scraped_data.txt && echo "✅ Data saved to scraped_data.txt" && cat scraped_data.txt
+   15  history | grep -E "Scraped recruiter profile|Found public profile URL" > scraped_data.txt && cat scraped_data.txt
